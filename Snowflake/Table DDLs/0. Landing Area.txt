@@ -1,0 +1,24 @@
+--Run 0:
+USE DWH;
+
+//csv landing area
+CREATE OR REPLACE FILE FORMAT CSV_FORMAT
+  TYPE = 'CSV';
+  
+CREATE OR REPLACE STAGE LANDING_AREA_CSV
+    FILE_FORMAT = CSV_FORMAT;
+    
+//json landing area
+CREATE OR REPLACE FILE FORMAT JSON_FORMAT
+  TYPE = 'JSON';
+  
+CREATE OR REPLACE STAGE LANDING_AREA_JSON
+    FILE_FORMAT = JSON_FORMAT;
+
+--Run 1:
+//Python script : upload_file.py file-1.csv LANDING_AREA_CSV 
+LIST @LANDING_AREA_CSV;
+
+--Run 2:
+//Python script : upload_file.py file-1.csv LANDING_AREA_JSON 
+LIST @LANDING_AREA_JSON;

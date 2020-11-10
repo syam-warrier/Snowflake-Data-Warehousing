@@ -1,0 +1,201 @@
+USE DWH;
+USE SCHEMA DWH_META;
+
+create or replace procedure fn_meta_merge_stage_from_landing(BATCH_ID string, STAGE_SCHEMA_TABLE_NAME string)
+  returns string not null
+  language javascript
+  as
+  $$
+    try
+    {
+        // Fetch stage table column names
+        var stage_col_list_cmd         =    "DESC TABLE DWH_ACTV_STAGING." + STAGE_SCHEMA_TABLE_NAME;
+        var statement                  =    snowflake.createStatement( {sqlText: stage_col_list_cmd} );
+        var stage_col_list_res         =    statement.execute();
+        
+        // Get All Columns List
+        var col_list = [], pk_col_list = [], non_pk_col_list = [];
+        while (stage_col_list_res.next())
+        {
+            col_list.push(stage_col_list_res.getColumnValue(2));
+            // Segregate PK and non-PK Columns List
+            if(stage_col_list_res.getColumnValue(7) == 'Y')
+                pk_col_list.push(stage_col_list_res.getColumnValue(2));
+            else
+                non_pk_col_list.push(stage_col_list_res.getColumnValue(2));
+         }
+        
+        // Define meta-data replacement strings
+        var meta_columns_dict = {
+        "INSERT" :  {
+                    "META_REC_SRCE_BUS_NME"   : "'<BUSINESSNAME>'",
+                    "META_REC_SRCE_FILE_NAME" : "B.META_REC_SRCE_FILE_NAME",
+                    "META_REC_SRCE_ROW_NUM"   : "B.META_REC_SRCE_ROW_NUM",
+                    "META_REC_BATCH_ID"       : BATCH_ID,
+                    "META_REC_CRE_DATE_TIME"  : "SYSDATE()",
+                    "META_REC_UPD_DATE_TIME"  : "NULL"
+                    },
+        "UPDATE" :  {
+                    "META_REC_SRCE_BUS_NME"   : "'<BUSINESSNAME>'",
+                    "META_REC_SRCE_FILE_NAME" : "B.META_REC_SRCE_FILE_NAME",
+                    "META_REC_SRCE_ROW_NUM"   : "B.META_REC_SRCE_ROW_NUM",
+                    "META_REC_BATCH_ID"       : BATCH_ID,
+                    "META_REC_CRE_DATE_TIME"  : "A.META_REC_CRE_DATE_TIME",
+                    "META_REC_UPD_DATE_TIME"  : "SYSDATE()"
+                    }
+        }
+        
+        // Generate JOIN condition
+        join_condition = pk_col_list.map(function(column) {return "\n\tA." + column + " = B." + column + ","}).join();
+        join_condition = join_condition.substr(0, join_condition.length - 1);
+        
+        // Generate UPDATE columns list
+        update_cols_part = non_pk_col_list.map(function(column) {return "\n\tA." + column + " = " + (Object.keys(meta_columns_dict["UPDATE"]).includes(column) ? meta_columns_dict["UPDATE"][column] : "B." + column) }).join();
+        
+        // Generate INSERT column values list
+        ins_cols_part = col_list.map(function(column) { return (Object.keys(meta_columns_dict["INSERT"]).includes(column) ? meta_columns_dict["INSERT"][column] : "B." + column) }).join();
+        
+        // Generate Query for merging landing table's data into active stage
+        var query = "MERGE INTO DWH_ACTV_STAGING." + STAGE_SCHEMA_TABLE_NAME + " A\nUSING DWH_LANDING." + STAGE_SCHEMA_TABLE_NAME + " B\nON" + join_condition + "\nWHEN MATCHED THEN UPDATE SET" + update_cols_part + "\n WHEN NOT MATCHED THEN INSERT (" + col_list.join(',') + ") VALUES (" + ins_cols_part + ");";
+        var statement = snowflake.createStatement( {sqlText: query} );
+        statement.execute()
+        
+        // Generate Query for merging landing table's data into active stage
+        var query = "INSERT INTO DWH_DATALAKE." + STAGE_SCHEMA_TABLE_NAME + "(" + col_list.join(',') + ")\nSELECT " + ins_cols_part + " FROM DWH_LANDING." + STAGE_SCHEMA_TABLE_NAME ;
+        var statement = snowflake.createStatement( {sqlText: query} );
+        statement.execute()
+        
+        return 0;
+    }
+     catch (err)
+     {
+        return err.code;
+     }
+  $$
+  ;
+  
+  CALL fn_meta_upd_stage_from_pre_stage('DWH_PRE_STAGE.BUSINESSNAME_PARTY', 'DWH_STAGE.BUSINESSNAME_PARTY');
+  
+  SELECT * FROM DWH_STAGE.BUSINESSNAME_PARTY;
+  
+MERGE INTO DWH_STAGE.BUSINESSNAME_PARTY A
+USING DWH_PRE_STAGE.BUSINESSNAME_PARTY B
+ON
+	A.ID = B.ID
+WHEN MATCHED THEN UPDATE SET
+	A.NAME = B.NAME,
+	A.ADDRESS = B.ADDRESS,
+	A.META_REC_SRCE_BUS_NME = '<BUSINESSNAME>',
+	A.META_REC_BATCH_ID = 0,
+	A.META_REC_CRE_DATE_TIME = A.META_REC_CRE_DATE_TIME,
+	A.META_REC_UPD_DATE_TIME = SYSDATE()
+ WHEN NOT MATCHED THEN INSERT (ID,NAME,ADDRESS,META_REC_SRCE_BUS_NME,META_REC_BATCH_ID,META_REC_CRE_DATE_TIME,META_REC_UPD_DATE_TIME) VALUES (B.ID,B.NAME,B.ADDRESS,'<BUSINESSNAME>',0,SYSDATE(),NULL);
+ 
+ 
+ select * from INFORMATION_SCHEMA.LOAD_HISTORY where TABLE_SCHEMA = 'DWH_PRE_STAGE' and table_name = 'BUSINESSNAME_PARTY' order by ordinal_position
+ 
+ select * from  INFORMATION_SCHEMA.ACCOUNT_USAGE.QUERY_HISTORY;
+ 
+ ----------------------------------------------------
+ 
+CREATE TABLE DWH_META.META_BATCH_DETAILS
+(
+  BATCH_ID INTEGER,
+  APPLICATION_NAME STRING,
+  BATCH_MODE STRING,
+  DATA_WINDOW_OPEN_TS TIMESTAMP,
+  DATA_WINDOW_CLOSE_TS TIMESTAMP,
+  BATCH_STATUS STRING,
+  BATCH_STATUS_DESCRIPTION STRING,
+  META_REC_INS_TS TIMESTAMP
+);
+
+SELECT * FROM DWH_META.META_BATCH_DETAILS;
+
+create or replace procedure fn_meta_open_batch(APPLICATION_NAME string, BATCH_MODE string)
+  returns float not null
+  language javascript
+  execute as caller
+  as     
+  $$  
+    // Fetch latest batch-id in META_BATCH_DETAILS table
+    var get_prev_batch_details_cmd      =   "select TO_VARCHAR(SYSDATE(), 'YYYYMMDDHHMISS')::INTEGER, COALESCE(max(case when APPLICATION_NAME = '" + APPLICATION_NAME + "' AND BATCH_MODE = '" + BATCH_MODE + "' AND BATCH_STATUS = 'SUCCESS' THEN DATA_WINDOW_CLOSE_TS END), TO_TIMESTAMP('1900-01-01 00:00:00')) from DWH_META.META_BATCH_DETAILS;";
+    var statement                       =   snowflake.createStatement( {sqlText: get_prev_batch_details_cmd} );
+    var prev_batch_details              =   statement.execute();
+    prev_batch_details.next();
+    
+    var new_batch_id                    =   prev_batch_details.getColumnValue(1);
+    var prev_success_batch_close_ts     =   prev_batch_details.getColumnValue(2);
+    
+    // Calculate new batch parameters
+    var batch_status                    =   'OPEN';
+    var batch_status_description        =   'Opening new ' + BATCH_MODE + ' job for ' + APPLICATION_NAME + '.';
+    
+    // Insert new batch id details in META_BATCH_DETAILS table
+    var insert_new_batch_details_cmd    =    "INSERT INTO DWH_META.META_BATCH_DETAILS VALUES (?,?,?,?,CURRENT_TIMESTAMP::TIMESTAMP_NTZ,?,?,CURRENT_TIMESTAMP::TIMESTAMP_NTZ)";
+    var statement                       =    snowflake.createStatement( {sqlText: insert_new_batch_details_cmd, binds:[new_batch_id, APPLICATION_NAME, BATCH_MODE, prev_success_batch_close_ts, batch_status, batch_status_description]} );
+    var insert_new_batch_id_status      =    statement.execute();
+    
+    return new_batch_id; 
+  $$
+  ;
+  
+  CALL fn_meta_open_batch('XYZ', 'BATCH');
+  
+  SELECT * FROM DWH_META.META_BATCH_DETAILS ORDER BY META_REC_INS_TS DESC;
+  
+  ----------------------------------------------------
+  
+  create or replace procedure fn_meta_close_batch(BATCH_ID string, BATCH_STATUS string)
+  returns float not null
+  language javascript
+  as     
+  $$
+    try
+    {
+        // Insert new batch id details in META_BATCH_DETAILS table
+        var insert_batch_close_details_cmd  =    "INSERT INTO DWH_META.META_BATCH_DETAILS SELECT BATCH_ID, APPLICATION_NAME, BATCH_MODE, DATA_WINDOW_OPEN_TS, DATA_WINDOW_CLOSE_TS, :1, BATCH_STATUS_DESCRIPTION, CURRENT_TIMESTAMP::TIMESTAMP_NTZ from DWH_META.META_BATCH_DETAILS WHERE BATCH_ID=:2;";
+        var statement                       =    snowflake.createStatement( {sqlText: insert_batch_close_details_cmd, binds:[BATCH_STATUS, BATCH_ID]} );
+        var insert_batch_close_status       =    statement.execute();
+
+        return 0;
+     }
+     catch (err)
+     {
+        return err.code;
+     }
+     
+  $$
+  ;
+  
+  SELECT * FROM DWH_META.META_BATCH_DETAILS WHERE BATCH_ID IN (1000001,1000002);
+  
+  CALL DWH_META.fn_meta_close_batch(20200528131457, 'SUCCESS');
+  
+  SELECT TO_VARCHAR(SYSDATE(), 'YYYYMMDDHHMISS')::INTEGER;
+  
+  SELECT *
+  FROM DWH_META.META_BATCH_DETAILS A
+  WHERE BATCH_STATUS = 'SUCCESS'
+  AND APPLICATION_NAME = 'PQR'
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY APPLICATION_NAME, BATCH_MODE ORDER BY META_REC_INS_TS DESC) = 1;
+  
+  SELECT *
+  FROM DWH_META.META_BATCH_DETAILS A
+  ORDER BY META_REC_INS_TS DESC;
+  
+SELECT *
+  FROM DWH_META.META_BATCH_DETAILS A
+  WHERE BATCH_STATUS = 'SUCCESS'
+  AND APPLICATION_NAME = 'PQR'
+  AND BATCH_MODE = 'BATCH'
+  QUALIFY ROW_NUMBER() OVER(PARTITION BY APPLICATION_NAME, BATCH_MODE ORDER BY META_REC_INS_TS DESC) = 1;
+  
+SELECT "DATA_WINDOW_CLOSE_TS" FROM "META_BATCH_DETAILS" WHERE ( "META_BATCH_DETAILS"."APPLICATION_NAME" = 'PQR' ) AND( "META_BATCH_DETAILS"."BATCH_MODE" = 'BATCH' )  LIMIT 1
+
+  SELECT APPLICATION_NAME, BATCH_MODE, MAX(DATA_WINDOW_CLOSE_TS)
+  FROM DWH_META.META_BATCH_DETAILS A
+  WHERE BATCH_STATUS = 'SUCCESS'
+  GROUP BY APPLICATION_NAME, BATCH_MODE;
+  
+SELECT "DATA_WINDOW_CLOSE_TS" FROM "META_BATCH_DETAILS" WHERE ( "META_BATCH_DETAILS"."APPLICATION_NAME" = 'DEF' ) AND( "META_BATCH_DETAILS"."BATCH_MODE" = 'BATCH' )  LIMIT 1
